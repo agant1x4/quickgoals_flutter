@@ -1,16 +1,18 @@
 import 'package:flutter/material.dart';
+import 'task_load.dart';
 
 // --- TASK ITEM DATA MODEL ---
 class TaskItem {
-  final String id; // Secure unique ID to prevent Dismissible swipe crashes
+  final String id;
   String title;
   String type; // 'Lesson', 'Quiz', 'Assignment'
   String description;
-  int difficulty;
+  int difficulty; // 1 to 5
+  TaskLoad load;
   DateTime? dueDate;
   bool isCompleted;
-  int durationMinutes; // Est. study block duration in minutes
-  String? subjectName; // Link task directly to a specific subject name
+  int durationMinutes;
+  String? subjectName;
 
   TaskItem({
     required this.id,
@@ -18,11 +20,44 @@ class TaskItem {
     required this.type,
     this.description = '',
     this.difficulty = 3,
+    this.load = TaskLoad.good,
     this.dueDate,
     this.isCompleted = false,
     this.durationMinutes = 30,
     this.subjectName,
   });
+
+  /// Single Task Cognitive Load (for Burnout Soft Cap)
+  double get cognitiveLoad => difficulty * load.multiplier;
+
+  /// Task Weight (for Daily Streak Calculation)
+  double get streakWeight => difficulty + (load.multiplier * 2.0);
+
+  TaskItem copyWith({
+    String? id,
+    String? title,
+    String? type,
+    String? description,
+    int? difficulty,
+    TaskLoad? load,
+    DateTime? dueDate,
+    bool? isCompleted,
+    int? durationMinutes,
+    String? subjectName,
+  }) {
+    return TaskItem(
+      id: id ?? this.id,
+      title: title ?? this.title,
+      type: type ?? this.type,
+      description: description ?? this.description,
+      difficulty: difficulty ?? this.difficulty,
+      load: load ?? this.load,
+      dueDate: dueDate ?? this.dueDate,
+      isCompleted: isCompleted ?? this.isCompleted,
+      durationMinutes: durationMinutes ?? this.durationMinutes,
+      subjectName: subjectName ?? this.subjectName,
+    );
+  }
 
   Map<String, dynamic> toMap() {
     return {
@@ -31,6 +66,7 @@ class TaskItem {
       'type': type,
       'description': description,
       'difficulty': difficulty,
+      'load': load.name,
       'dueDate': dueDate?.toIso8601String(),
       'isCompleted': isCompleted,
       'durationMinutes': durationMinutes,
@@ -39,15 +75,16 @@ class TaskItem {
   }
 
   factory TaskItem.fromMap(Map<String, dynamic> map) {
-    final String fallbackId =
-        '${DateTime.now().millisecondsSinceEpoch}_${(map['title'] ?? '').hashCode}';
-
     return TaskItem(
-      id: map['id'] ?? fallbackId,
+      id: map['id'] ?? 'task_${DateTime.now().millisecondsSinceEpoch}',
       title: map['title'] ?? '',
       type: map['type'] ?? 'Lesson',
       description: map['description'] ?? '',
       difficulty: map['difficulty'] ?? 3,
+      load: TaskLoad.values.firstWhere(
+        (e) => e.name == map['load'],
+        orElse: () => TaskLoad.good,
+      ),
       dueDate: map['dueDate'] != null ? DateTime.parse(map['dueDate']) : null,
       isCompleted: map['isCompleted'] ?? false,
       durationMinutes: map['durationMinutes'] ?? 30,
@@ -68,7 +105,7 @@ class SubjectTaskData {
   int motivationLevel;
   int averageDurationMins;
 
-  // Streak tracking fields added safely without breaking legacy schema
+  // Streak tracking fields
   int currentStreak;
   int bestStreak;
   DateTime? lastCompletedDate;
@@ -89,7 +126,6 @@ class SubjectTaskData {
     List<TaskItem>? taskList,
   }) : taskList = taskList ?? [];
 
-  // Register completion and update current/best streak counts
   void registerTaskCompletion() {
     final now = DateTime.now();
     final today = DateTime(now.year, now.month, now.day);
@@ -117,18 +153,19 @@ class SubjectTaskData {
     }
   }
 
-  // Compute total dynamic overdue tasks reactively
   int get totalOverdueTasks {
     final now = DateTime.now();
+    final startOfToday = DateTime(now.year, now.month, now.day);
     return taskList
         .where(
           (t) =>
-              !t.isCompleted && t.dueDate != null && t.dueDate!.isBefore(now),
+              !t.isCompleted &&
+              t.dueDate != null &&
+              t.dueDate!.isBefore(startOfToday),
         )
         .length;
   }
 
-  // Calculate overdue age in days safely
   int get overdueAge {
     final now = DateTime.now();
     int maxDays = 0;

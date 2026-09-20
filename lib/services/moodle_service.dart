@@ -1,18 +1,26 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/task_models.dart';
+import '../models/task_load.dart';
 
+/// Comprehensive service for interacting with Moodle Web Services API.
+/// Handles authentication, module extraction (lessons, quizzes, assignments),
+/// completion filtering, Levenshtein fuzzy course matching, and hourly sync tracking.
 class MoodleService {
   final String baseUrl;
   final String token;
+
+  static const String _lastSyncKey = 'moodle_last_sync_timestamp';
 
   MoodleService({
     required this.token,
     this.baseUrl = 'https://www.winguacademy.co.za',
   });
 
+  /// Authenticates with Moodle via username/password and retrieves a Web Service token.
   static Future<String?> authenticateAndFetchToken({
     required String username,
     required String password,
@@ -46,23 +54,69 @@ class MoodleService {
     return null;
   }
 
-  bool _hasMatchingSubsequence(String str1, String str2, {int minLength = 3}) {
-    final s1 = str1.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
-    final s2 = str2.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+  /// Calculates the Levenshtein distance between two strings (number of edits required).
+  int _levenshteinDistance(String s1, String s2) {
+    if (s1 == s2) return 0;
+    if (s1.isEmpty) return s2.length;
+    if (s2.isEmpty) return s1.length;
 
-    if (s1.length < minLength || s2.length < minLength) {
-      return s1.contains(s2) || s2.contains(s1);
-    }
+    List<int> v0 = List<int>.generate(s2.length + 1, (i) => i);
+    List<int> v1 = List<int>.filled(s2.length + 1, 0);
 
-    for (int i = 0; i <= s1.length - minLength; i++) {
-      final sub = s1.substring(i, i + minLength);
-      if (s2.contains(sub)) {
-        return true;
+    for (int i = 0; i < s1.length; i++) {
+      v1[0] = i + 1;
+      for (int j = 0; j < s2.length; j++) {
+        int cost = (s1.codeUnitAt(i) == s2.codeUnitAt(j)) ? 0 : 1;
+        v1[j + 1] = [v1[j] + 1, v0[j + 1] + 1, v0[j] + cost].reduce(min);
+      }
+      for (int j = 0; j <= s2.length; j++) {
+        v0[j] = v1[j];
       }
     }
-    return false;
+    return v1[s2.length];
   }
 
+  /// Calculates similarity score between two strings using normalized Levenshtein token matching.
+  /// Returns a value between 0.0 (no match) and 1.0 (exact match).
+  double _calculateSimilarity(String s1, String s2) {
+    final clean1 = s1
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9\s]'), '')
+        .trim();
+    final clean2 = s2
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9\s]'), '')
+        .trim();
+
+    if (clean1.isEmpty || clean2.isEmpty) return 0.0;
+    if (clean1 == clean2) return 1.0;
+
+    final tokens1 = clean1.split(RegExp(r'\s+'));
+    final tokens2 = clean2.split(RegExp(r'\s+'));
+
+    double maxScore = 0.0;
+
+    // Check token-to-token similarity for course codes and title abbreviations
+    for (var t1 in tokens1) {
+      if (t1.length < 3) continue;
+      for (var t2 in tokens2) {
+        if (t2.length < 3) continue;
+        final dist = _levenshteinDistance(t1, t2);
+        final maxLen = max(t1.length, t2.length);
+        final sim = 1.0 - (dist / maxLen);
+        if (sim > maxScore) maxScore = sim;
+      }
+    }
+
+    // Also compare full string distance for complete matches
+    final fullDist = _levenshteinDistance(clean1, clean2);
+    final fullMaxLen = max(clean1.length, clean2.length);
+    final fullSim = 1.0 - (fullDist / fullMaxLen);
+
+    return max(maxScore, fullSim);
+  }
+
+  /// Maps raw Moodle activities to the user's subjects using Levenshtein similarity.
   List<SubjectTaskData> mapMoodleActivitiesToSubjects({
     required List<Map<String, dynamic>> rawActivities,
     required List<SubjectTaskData> userSubjects,
@@ -75,13 +129,21 @@ class MoodleService {
       final String description = raw['description'] ?? '';
       final DateTime dueDate = raw['dueDate'] as DateTime? ?? DateTime.now();
       final int duration = raw['durationMinutes'] as int? ?? 30;
+      final String type = raw['type'] ?? 'Lesson';
 
-      // Smart fuzzy match with >= 3 consecutive character overlap
-      SubjectTaskData targetSubject = userSubjects.firstWhere(
-        (subject) => _hasMatchingSubsequence(subject.name, rawCourseName, minLength: 3),
-        orElse: () => userSubjects.first,
-      );
+      // Find best matching subject using Levenshtein distance
+      SubjectTaskData targetSubject = userSubjects.first;
+      double highestScore = -1.0;
 
+      for (var subject in userSubjects) {
+        final score = _calculateSimilarity(subject.name, rawCourseName);
+        if (score > highestScore) {
+          highestScore = score;
+          targetSubject = subject;
+        }
+      }
+
+      // Prevent duplicate insertion
       bool alreadyExists = targetSubject.taskList.any(
         (t) => t.title.trim().toLowerCase() == rawTitle.trim().toLowerCase(),
       );
@@ -91,14 +153,14 @@ class MoodleService {
           TaskItem(
             id: raw['id'] ?? 'moodle_${DateTime.now().microsecondsSinceEpoch}',
             title: rawTitle,
-            type: rawTitle.toLowerCase().contains('quiz')
-                ? 'Quiz'
-                : (rawTitle.toLowerCase().contains('assignment')
-                    ? 'Assignment'
-                    : 'Lesson'),
+            type: type,
             description: description,
             dueDate: dueDate,
             durationMinutes: duration,
+            load: type == 'Assignment'
+                ? TaskLoad.stressed
+                : (type == 'Quiz' ? TaskLoad.meh : TaskLoad.good),
+            subjectName: targetSubject.name,
           ),
         );
       }
@@ -107,6 +169,7 @@ class MoodleService {
     return userSubjects;
   }
 
+  /// Helper method for safe web service POST queries.
   Future<http.Response?> _safePost(
     String wsFunction,
     Map<String, String> bodyFields,
@@ -138,6 +201,8 @@ class MoodleService {
     return null;
   }
 
+  /// Primary method to fetch all course contents (Lessons, Quizzes, Assignments, Pages).
+  /// Automatically filters out completed tasks based on Moodle's `completionstate`.
   Future<List<Map<String, dynamic>>> fetchMoodleActivities() async {
     List<Map<String, dynamic>> activities = [];
 
@@ -162,7 +227,79 @@ class MoodleService {
           int courseId = c['id'];
           String courseTitle = c['fullname'] ?? 'General';
 
-          // Fetch assignments
+          // 1. Query core_course_get_contents to discover ALL modules (Lessons, Pages, Resources)
+          final contentsRes = await _safePost('core_course_get_contents', {
+            'courseid': courseId.toString(),
+          });
+
+          if (contentsRes != null) {
+            final dynamicSections = jsonDecode(contentsRes.body);
+            if (dynamicSections is List) {
+              for (var section in dynamicSections) {
+                final modules = section['modules'] ?? [];
+                for (var mod in modules) {
+                  final String modName = mod['modname'] ?? '';
+                  final String title = mod['name'] ?? '';
+                  final int modId = mod['id'] ?? 0;
+
+                  // Completion Filtering: state 1 (complete), 2 (complete pass)
+                  final completionData = mod['completiondata'];
+                  int completionState = 0;
+                  if (completionData != null && completionData is Map) {
+                    completionState = completionData['state'] ?? 0;
+                  }
+
+                  // Skip already completed activities
+                  if (completionState == 1 || completionState == 2) {
+                    continue;
+                  }
+
+                  // Determine Activity Type and Metadata
+                  String activityType = 'Lesson';
+                  int durationMinutes = 20;
+
+                  if (modName == 'quiz' ||
+                      title.toLowerCase().contains('quiz')) {
+                    activityType = 'Quiz';
+                    durationMinutes = 30;
+                  } else if (modName == 'assign' ||
+                      title.toLowerCase().contains('assignment')) {
+                    activityType = 'Assignment';
+                    durationMinutes = 60;
+                  } else if (modName == 'lesson' ||
+                      modName == 'page' ||
+                      modName == 'resource') {
+                    activityType = 'Lesson';
+                    durationMinutes = 25;
+                  } else {
+                    // Skip non-actionable administrative modules
+                    if (modName == 'forum' ||
+                        modName == 'folder' ||
+                        modName == 'label') {
+                      continue;
+                    }
+                  }
+
+                  // Standardize deadline to a fixed end-of-day target (23:59)
+                  DateTime targetDate = _standardizeFixedDeadline(null);
+
+                  activities.add({
+                    'id': 'moodle_${modName}_$modId',
+                    'title': title,
+                    'course': courseTitle,
+                    'type': activityType,
+                    'dueDate': targetDate,
+                    'durationMinutes': durationMinutes,
+                    'description': _stripHtml(
+                      mod['description'] ?? mod['intro'] ?? '',
+                    ),
+                  });
+                }
+              }
+            }
+          }
+
+          // 2. Query mod_assign_get_assignments to enrich precise due dates if available
           final assignRes = await _safePost('mod_assign_get_assignments', {
             'courseids[0]': courseId.toString(),
           });
@@ -171,25 +308,30 @@ class MoodleService {
             if (assignData is Map && assignData['courses'] != null) {
               for (var courseBlock in assignData['courses']) {
                 for (var assign in (courseBlock['assignments'] ?? [])) {
-                  DateTime? dueDate;
+                  final String assignId = 'moodle_assign_${assign['id']}';
+                  final index = activities.indexWhere(
+                    (a) => a['id'] == assignId,
+                  );
+
                   if (assign['duedate'] != null && assign['duedate'] > 0) {
-                    dueDate = DateTime.fromMillisecondsSinceEpoch(assign['duedate'] * 1000);
+                    final rawDueDate = DateTime.fromMillisecondsSinceEpoch(
+                      assign['duedate'] * 1000,
+                    );
+                    final fixedDate = _standardizeFixedDeadline(rawDueDate);
+
+                    if (index != -1) {
+                      activities[index]['dueDate'] = fixedDate;
+                      activities[index]['description'] = _stripHtml(
+                        assign['intro'] ?? '',
+                      );
+                    }
                   }
-                  activities.add({
-                    'id': 'moodle_assign_${assign['id']}',
-                    'title': assign['name'] ?? 'Assignment',
-                    'course': courseTitle,
-                    'type': 'Assignment',
-                    'dueDate': dueDate ?? DateTime.now(),
-                    'durationMinutes': 45,
-                    'description': _stripHtml(assign['intro'] ?? ''),
-                  });
                 }
               }
             }
           }
 
-          // Fetch quizzes
+          // 3. Query mod_quiz_get_quizzes_by_courses to enrich quiz closing times
           final quizRes = await _safePost('mod_quiz_get_quizzes_by_courses', {
             'courseids[0]': courseId.toString(),
           });
@@ -197,19 +339,22 @@ class MoodleService {
             final quizData = jsonDecode(quizRes.body);
             if (quizData is Map && quizData['quizzes'] != null) {
               for (var quiz in quizData['quizzes']) {
-                DateTime? timeClose;
+                final String quizId = 'moodle_quiz_${quiz['id']}';
+                final index = activities.indexWhere((a) => a['id'] == quizId);
+
                 if (quiz['timeclose'] != null && quiz['timeclose'] > 0) {
-                  timeClose = DateTime.fromMillisecondsSinceEpoch(quiz['timeclose'] * 1000);
+                  final rawClose = DateTime.fromMillisecondsSinceEpoch(
+                    quiz['timeclose'] * 1000,
+                  );
+                  final fixedDate = _standardizeFixedDeadline(rawClose);
+
+                  if (index != -1) {
+                    activities[index]['dueDate'] = fixedDate;
+                    activities[index]['description'] = _stripHtml(
+                      quiz['intro'] ?? '',
+                    );
+                  }
                 }
-                activities.add({
-                  'id': 'moodle_quiz_${quiz['id']}',
-                  'title': quiz['name'] ?? 'Quiz',
-                  'course': courseTitle,
-                  'type': 'Quiz',
-                  'dueDate': timeClose ?? DateTime.now(),
-                  'durationMinutes': 30,
-                  'description': _stripHtml(quiz['intro'] ?? ''),
-                });
               }
             }
           }
@@ -223,9 +368,19 @@ class MoodleService {
       return _generateFallbackMockActivities();
     }
 
+    // Save timestamp for background hourly sync tracking
+    await updateSyncTimestamp();
+
     return activities;
   }
 
+  /// Converts timestamps into fixed, clean target dates (23:59) for student planning.
+  DateTime _standardizeFixedDeadline(DateTime? rawDate) {
+    final base = rawDate ?? DateTime.now();
+    return DateTime(base.year, base.month, base.day, 23, 59);
+  }
+
+  /// Removes HTML tags from Moodle descriptions.
   String _stripHtml(String input) {
     return input.replaceAll(RegExp(r'<[^>]*>'), '').trim();
   }
@@ -235,23 +390,51 @@ class MoodleService {
     return [
       {
         'id': 'moodle_fallback_1',
-        'title': 'Quiz 1: Data Structures Overview',
+        'title': 'Lesson 1: Introduction to Data Structures',
         'course': 'Computer Science',
-        'type': 'Quiz',
-        'description': 'Online quiz covering stacks, queues, and complexity analysis.',
-        'dueDate': DateTime(now.year, now.month, now.day, 10, 0),
-        'durationMinutes': 45,
+        'type': 'Lesson',
+        'description':
+            'Read chapter overview on arrays, linked lists, and stacks.',
+        'dueDate': DateTime(now.year, now.month, now.day, 23, 59),
+        'durationMinutes': 25,
       },
       {
         'id': 'moodle_fallback_2',
+        'title': 'Quiz 1: Data Structures Overview',
+        'course': 'Computer Science',
+        'type': 'Quiz',
+        'description':
+            'Online quiz covering stacks, queues, and complexity analysis.',
+        'dueDate': DateTime(now.year, now.month, now.day, 23, 59),
+        'durationMinutes': 30,
+      },
+      {
+        'id': 'moodle_fallback_3',
         'title': 'Assignment 2: Vector Calculus Set',
         'course': 'Mathematics',
         'type': 'Assignment',
-        'description': 'Complete exercises from chapter 4. Upload scan to Moodle.',
-        'dueDate': DateTime(now.year, now.month, now.day, 13, 30),
+        'description':
+            'Complete exercises from chapter 4. Upload scan to Moodle.',
+        'dueDate': DateTime(now.year, now.month, now.day, 23, 59),
         'durationMinutes': 60,
       },
     ];
+  }
+
+  /// Checks if 60 minutes have elapsed since the last Moodle API sync.
+  static Future<bool> shouldSyncHourly() async {
+    final prefs = await SharedPreferences.getInstance();
+    final lastSync = prefs.getInt(_lastSyncKey) ?? 0;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final int sixtyMinutesInMs = 60 * 60 * 1000;
+
+    return (now - lastSync) >= sixtyMinutesInMs;
+  }
+
+  /// Updates the stored timestamp of the last successful synchronization.
+  static Future<void> updateSyncTimestamp() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_lastSyncKey, DateTime.now().millisecondsSinceEpoch);
   }
 
   static Future<String?> getSavedToken() async {
@@ -267,5 +450,6 @@ class MoodleService {
   static Future<void> clearSavedToken() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('moodle_token');
+    await prefs.remove(_lastSyncKey);
   }
 }

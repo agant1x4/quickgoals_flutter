@@ -4,7 +4,9 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/task_models.dart';
 import '../services/moodle_service.dart';
+import '../algorithms/calendar_engine.dart';
 import '../widgets/geometry.dart';
+import '../widgets/task_pill_card.dart';
 import 'nav_drawer.dart';
 import 'pomodoro.dart';
 
@@ -21,24 +23,70 @@ enum CalendarViewScope { day, week, month }
 
 class _ReviewPageState extends State<ReviewPage> {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  final CalendarEngine _calendarEngine = CalendarEngine(
+    startHour: 4,
+    endHour: 23,
+    hourHeight: 72.0,
+  );
+  late final ScrollController _timelineScrollController;
 
   bool _isLoading = true;
   CalendarViewScope _currentView = CalendarViewScope.day;
   DateTime _selectedDate = DateTime.now();
+  double _dailySoftCap = 30.0;
 
   List<SubjectTaskData> _activeSubjects = [];
   _CalendarTaskWrapper? _selectedTask;
 
-  // Colors matching design guidelines
-  final Color _dayColor = const Color(0xFFFFB03B); // Warm Yellow/Orange
-  final Color _weekColor = const Color(0xFF6C9EFF); // Soft Blue
-  final Color _monthColor = const Color(0xFF9E9E9E); // Grey
+  bool _isMultiSelectMode = false;
+  final Set<_CalendarTaskWrapper> _selectedTasks = {};
+
+  final Color _dayColor = const Color(0xFFFFB03B);
+  final Color _weekColor = const Color(0xFF6C9EFF);
+  final Color _monthColor = const Color(0xFF9E9E9E);
 
   @override
   void initState() {
     super.initState();
     _activeSubjects = List.from(widget.userSubjects);
+    _timelineScrollController = ScrollController();
     _initializeCalendarAndSync();
+  }
+
+  @override
+  void dispose() {
+    _timelineScrollController.dispose();
+    super.dispose();
+  }
+
+  double _calculateTotalLoadForDate(DateTime date) {
+    double total = 0.0;
+    for (var subject in _activeSubjects) {
+      for (var task in subject.taskList) {
+        if (!task.isCompleted &&
+            task.dueDate != null &&
+            _isSameDay(task.dueDate!, date)) {
+          total += _calendarEngine.getEffectiveTaskLoad(task);
+        }
+      }
+    }
+    return total;
+  }
+
+  void _checkSoftCapWarning(DateTime date) {
+    final currentLoad = _calculateTotalLoadForDate(date);
+    if (currentLoad > _dailySoftCap) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            "⚠️ Daily workload capacity warning (${currentLoad.toStringAsFixed(1)} / ${_dailySoftCap.toInt()} Load). Consider spreading out tasks.",
+            style: GoogleFonts.quicksand(fontWeight: FontWeight.bold),
+          ),
+          backgroundColor: const Color(0xFFE53935),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
   }
 
   Future<void> _initializeCalendarAndSync() async {
@@ -46,7 +94,6 @@ class _ReviewPageState extends State<ReviewPage> {
     final prefs = await SharedPreferences.getInstance();
     final savedToken = prefs.getString('moodle_token');
 
-    // Load cached subject state if passed list was empty
     if (_activeSubjects.isEmpty) {
       final cachedJson = prefs.getString('quickgoals_user_subjects');
       if (cachedJson != null && cachedJson.isNotEmpty) {
@@ -61,7 +108,6 @@ class _ReviewPageState extends State<ReviewPage> {
       }
     }
 
-    // Default fallback subject if nothing exists
     if (_activeSubjects.isEmpty) {
       _activeSubjects = [
         SubjectTaskData(
@@ -72,7 +118,6 @@ class _ReviewPageState extends State<ReviewPage> {
       ];
     }
 
-    // Fetch live Moodle activities if token exists and perform smart mapping
     if (savedToken != null && savedToken.trim().isNotEmpty) {
       try {
         final moodleService = MoodleService(token: savedToken.trim());
@@ -87,15 +132,29 @@ class _ReviewPageState extends State<ReviewPage> {
       }
     }
 
-    // Select initial task wrapper for side panel tablet view
-    final todayTasks = _getTasksForSelectedScope();
-    if (todayTasks.isNotEmpty) {
-      _selectedTask = todayTasks.first;
+    final positions = _calendarEngine.processTaskPositions(
+      _activeSubjects,
+      _selectedDate,
+    );
+    if (positions.isNotEmpty) {
+      _selectedTask = _CalendarTaskWrapper(
+        subject: positions.first.subject,
+        task: positions.first.task,
+      );
     }
 
     if (mounted) {
-      setState(() {
-        _isLoading = false;
+      setState(() => _isLoading = false);
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_timelineScrollController.hasClients) {
+          final initialOffset = _calendarEngine.getInitialScrollOffset(
+            DateTime.now(),
+            positions,
+          );
+          _timelineScrollController.jumpTo(initialOffset);
+        }
+        _checkSoftCapWarning(_selectedDate);
       });
     }
   }
@@ -106,66 +165,49 @@ class _ReviewPageState extends State<ReviewPage> {
     await prefs.setString('quickgoals_user_subjects', jsonEncode(jsonList));
   }
 
-  List<_CalendarTaskWrapper> _getTasksForSelectedScope() {
-    List<_CalendarTaskWrapper> items = [];
-    for (var subject in _activeSubjects) {
-      for (var task in subject.taskList) {
-        if (task.dueDate == null) continue;
-
-        bool include = false;
-        if (_currentView == CalendarViewScope.day) {
-          include = _isSameDay(task.dueDate!, _selectedDate);
-        } else if (_currentView == CalendarViewScope.week) {
-          final startOfWeek = _selectedDate.subtract(
-            Duration(days: _selectedDate.weekday - 1),
-          );
-          final startOfDay = DateTime(
-            startOfWeek.year,
-            startOfWeek.month,
-            startOfWeek.day,
-          );
-          final endOfWeek = startOfDay.add(
-            const Duration(days: 6, hours: 23, minutes: 59),
-          );
-          include =
-              task.dueDate!.isAfter(
-                startOfDay.subtract(const Duration(seconds: 1)),
-              ) &&
-              task.dueDate!.isBefore(endOfWeek);
-        } else {
-          include =
-              task.dueDate!.month == _selectedDate.month &&
-              task.dueDate!.year == _selectedDate.year;
-        }
-
-        if (include) {
-          items.add(_CalendarTaskWrapper(subject: subject, task: task));
-        }
-      }
-    }
-
-    items.sort(
-      (a, b) => (a.task.dueDate ?? DateTime.now()).compareTo(
-        b.task.dueDate ?? DateTime.now(),
-      ),
-    );
-    return items;
-  }
-
   bool _isSameDay(DateTime a, DateTime b) {
     return a.year == b.year && a.month == b.month && a.day == b.day;
   }
 
   String _formatDuration(int minutes) {
-    if (minutes < 60) {
-      return "$minutes mins";
-    }
+    if (minutes < 60) return "$minutes mins";
     final hours = minutes ~/ 60;
     final remainingMins = minutes % 60;
-    if (remainingMins == 0) {
-      return "$hours hr${hours > 1 ? 's' : ''}";
-    }
+    if (remainingMins == 0) return "$hours hr${hours > 1 ? 's' : ''}";
     return "$hours hr $remainingMins mins";
+  }
+
+  void _toggleTaskSelection(_CalendarTaskWrapper item) {
+    setState(() {
+      if (_selectedTasks.contains(item)) {
+        _selectedTasks.remove(item);
+        if (_selectedTasks.isEmpty) _isMultiSelectMode = false;
+      } else {
+        _selectedTasks.add(item);
+      }
+    });
+  }
+
+  void _exitMultiSelectMode() {
+    setState(() {
+      _isMultiSelectMode = false;
+      _selectedTasks.clear();
+    });
+  }
+
+  void _completeTaskFromReview(_CalendarTaskWrapper wrapper) {
+    setState(() {
+      wrapper.task.isCompleted = true;
+      wrapper.subject.taskList.remove(wrapper.task);
+    });
+    _saveSubjectsCache();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text("Completed: ${wrapper.task.title}"),
+        backgroundColor: const Color(0xFF53C580),
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   void _showEditTaskModal(_CalendarTaskWrapper wrapper) {
@@ -174,6 +216,7 @@ class _ReviewPageState extends State<ReviewPage> {
       text: wrapper.task.description,
     );
     int selectedDuration = wrapper.task.durationMinutes;
+    DateTime newDueDate = wrapper.task.dueDate ?? _selectedDate;
 
     showDialog(
       context: context,
@@ -237,9 +280,8 @@ class _ReviewPageState extends State<ReviewPage> {
                             );
                           }).toList(),
                           onChanged: (val) {
-                            if (val != null) {
+                            if (val != null)
                               setModalState(() => selectedDuration = val);
-                            }
                           },
                         ),
                       ],
@@ -267,9 +309,11 @@ class _ReviewPageState extends State<ReviewPage> {
                       wrapper.task.title = titleController.text.trim();
                       wrapper.task.description = descController.text.trim();
                       wrapper.task.durationMinutes = selectedDuration;
+                      wrapper.task.dueDate = newDueDate;
                     });
                     _saveSubjectsCache();
                     Navigator.pop(context);
+                    _checkSoftCapWarning(newDueDate);
                   },
                   child: Text(
                     "Save",
@@ -282,6 +326,78 @@ class _ReviewPageState extends State<ReviewPage> {
               ],
             );
           },
+        );
+      },
+    );
+  }
+
+  void _showQuickgoalBundleSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (context) {
+        int totalMins = _selectedTasks.fold(
+          0,
+          (sum, item) => sum + item.task.durationMinutes,
+        );
+        return Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'New Quickgoal Bundle',
+                style: GoogleFonts.quicksand(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: const Color(0xFF1E293B),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Bundling ${_selectedTasks.length} tasks ($totalMins mins total duration)',
+                style: GoogleFonts.quicksand(
+                  fontSize: 13,
+                  color: Colors.grey[600],
+                ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    _exitMultiSelectMode();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Quickgoal bundle created successfully!'),
+                        backgroundColor: Color(0xFF53C580),
+                      ),
+                    );
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E293B),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  child: Text(
+                    'Confirm Bundle',
+                    style: GoogleFonts.quicksand(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
         );
       },
     );
@@ -335,9 +451,91 @@ class _ReviewPageState extends State<ReviewPage> {
             ? const Center(
                 child: CircularProgressIndicator(color: Color(0xFFFFB03B)),
               )
-            : isTablet
-            ? _buildTabletLayout()
-            : _buildPhoneLayout(),
+            : Stack(
+                children: [
+                  isTablet ? _buildTabletLayout() : _buildPhoneLayout(),
+                  if (_isMultiSelectMode)
+                    Positioned(
+                      bottom: 24,
+                      left: 20,
+                      right: 20,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 12,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(
+                            0xFF1E293B,
+                          ).withValues(alpha: 0.95),
+                          borderRadius: BorderRadius.circular(24),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.20),
+                              blurRadius: 16,
+                              offset: const Offset(0, 6),
+                            ),
+                          ],
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(
+                              children: [
+                                GestureDetector(
+                                  onTap: _exitMultiSelectMode,
+                                  child: const Icon(
+                                    Icons.close,
+                                    color: Colors.white70,
+                                    size: 20,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Text(
+                                  '${_selectedTasks.length} selected',
+                                  style: GoogleFonts.quicksand(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            ElevatedButton.icon(
+                              onPressed: _selectedTasks.isEmpty
+                                  ? null
+                                  : _showQuickgoalBundleSheet,
+                              icon: const Icon(
+                                Icons.bolt_rounded,
+                                size: 16,
+                                color: Colors.white,
+                              ),
+                              label: Text(
+                                'Bundle Quickgoal',
+                                style: GoogleFonts.quicksand(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFFFFB03B),
+                                elevation: 0,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 10,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(16),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
       ),
     );
   }
@@ -363,7 +561,6 @@ class _ReviewPageState extends State<ReviewPage> {
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Left Column: Timeline Schedule Canvas
               Expanded(
                 flex: 6,
                 child: Column(
@@ -376,7 +573,6 @@ class _ReviewPageState extends State<ReviewPage> {
                 ),
               ),
               Container(width: 1, color: const Color(0xFFEFEFEF)),
-              // Right Column: Side Activity Detail Inspector Panel
               Expanded(
                 flex: 4,
                 child: Padding(
@@ -495,6 +691,7 @@ class _ReviewPageState extends State<ReviewPage> {
     String dayName = days[_selectedDate.weekday - 1];
     String monthName = months[_selectedDate.month - 1];
     String dateText = "$dayName  $monthName ${_selectedDate.day}";
+    final double totalLoad = _calculateTotalLoadForDate(_selectedDate);
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -514,10 +711,12 @@ class _ReviewPageState extends State<ReviewPage> {
               ),
               const SizedBox(height: 2),
               Text(
-                "At a glance:",
+                "Workload: ${totalLoad.toStringAsFixed(1)} / ${_dailySoftCap.toInt()} Load",
                 style: GoogleFonts.quicksand(
                   fontSize: 12,
-                  color: const Color(0xFF94A3B8),
+                  color: totalLoad > _dailySoftCap
+                      ? const Color(0xFFE53935)
+                      : const Color(0xFF94A3B8),
                   fontWeight: FontWeight.w600,
                 ),
               ),
@@ -531,6 +730,7 @@ class _ReviewPageState extends State<ReviewPage> {
               setState(() {
                 _selectedDate = _selectedDate.subtract(const Duration(days: 1));
               });
+              _checkSoftCapWarning(_selectedDate);
             },
           ),
           IconButton(
@@ -540,6 +740,7 @@ class _ReviewPageState extends State<ReviewPage> {
               setState(() {
                 _selectedDate = _selectedDate.add(const Duration(days: 1));
               });
+              _checkSoftCapWarning(_selectedDate);
             },
           ),
         ],
@@ -548,178 +749,134 @@ class _ReviewPageState extends State<ReviewPage> {
   }
 
   Widget _buildTimelineCanvasView() {
-    final tasks = _getTasksForSelectedScope();
+    final scheduledPositions = _calendarEngine.processTaskPositions(
+      _activeSubjects,
+      _selectedDate,
+    );
     final now = DateTime.now();
     final bool isToday = _isSameDay(_selectedDate, now);
 
-    const double hourHeight = 72.0;
-    const int startHour = 8;
-    const int endHour = 18;
+    final int startHour = _calendarEngine.startHour;
+    final int endHour = _calendarEngine.endHour;
+    final double hourHeight = _calendarEngine.hourHeight;
     final int totalHours = endHour - startHour + 1;
 
+    final double liveOffset = _calendarEngine.getCurrentTimeOffset(now) ?? -1.0;
+
     return SingleChildScrollView(
+      controller: _timelineScrollController,
       physics: const BouncingScrollPhysics(),
-      padding: const EdgeInsets.only(bottom: 40),
-      child: Stack(
-        children: [
-          // 1. Time Labels & Horizontal Grid Lines
-          Column(
-            children: List.generate(totalHours, (index) {
-              final hour = startHour + index;
-              final hourText = "${hour.toString().padLeft(2, '0')}:00";
+      padding: const EdgeInsets.only(bottom: 100),
+      child: SizedBox(
+        height: _calendarEngine.totalCanvasHeight,
+        child: Stack(
+          children: [
+            Column(
+              children: List.generate(totalHours, (index) {
+                final hour = startHour + index;
+                final hourText = "${hour.toString().padLeft(2, '0')}:00";
 
-              return SizedBox(
-                height: hourHeight,
-                child: Row(
-                  children: [
-                    SizedBox(
-                      width: 60,
-                      child: Padding(
-                        padding: const EdgeInsets.only(left: 16.0),
-                        child: Text(
-                          hourText,
-                          style: GoogleFonts.quicksand(
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                            color: const Color(0xFF94A3B8),
-                          ),
-                        ),
-                      ),
-                    ),
-                    Expanded(
-                      child: Container(
-                        height: 1,
-                        color: const Color(0xFFF1F5F9),
-                      ),
-                    ),
-                  ],
-                ),
-              );
-            }),
-          ),
-
-          // 2. Red Live Current Time Line Indicator
-          if (isToday && now.hour >= startHour && now.hour <= endHour) ...[
-            Builder(
-              builder: (context) {
-                final minutesFromStart =
-                    ((now.hour - startHour) * 60) + now.minute;
-                final topOffset = (minutesFromStart / 60.0) * hourHeight;
-
-                return Positioned(
-                  top: topOffset,
-                  left: 48,
-                  right: 16,
+                return SizedBox(
+                  height: hourHeight,
                   child: Row(
                     children: [
-                      Container(
-                        width: 14,
-                        height: 14,
-                        decoration: const BoxDecoration(
-                          color: Color(0xFFEF4444),
-                          shape: BoxShape.circle,
+                      SizedBox(
+                        width: 60,
+                        child: Padding(
+                          padding: const EdgeInsets.only(left: 16.0),
+                          child: Text(
+                            hourText,
+                            style: GoogleFonts.quicksand(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: const Color(0xFF94A3B8),
+                            ),
+                          ),
                         ),
                       ),
                       Expanded(
                         child: Container(
-                          height: 2,
-                          color: const Color(0xFFEF4444),
+                          height: 1,
+                          color: const Color(0xFFF1F5F9),
                         ),
                       ),
                     ],
                   ),
                 );
-              },
+              }),
             ),
-          ],
-
-          // 3. Dynamic Task Activity Pills scaled by duration
-          ...List.generate(tasks.length, (index) {
-            final item = tasks[index];
-            final task = item.task;
-            final subject = item.subject;
-
-            final taskDate = task.dueDate ?? DateTime.now();
-            final hour = taskDate.hour < startHour ? startHour : taskDate.hour;
-            final minute = taskDate.minute;
-
-            final minutesFromStart = ((hour - startHour) * 60) + minute;
-            final topOffset = (minutesFromStart / 60.0) * hourHeight;
-
-            // Height scaled to duration
-            final double pillHeight =
-                ((task.durationMinutes / 60.0) * hourHeight).clamp(48.0, 180.0);
-
-            // Stagger horizontal position for overlapping slots
-            final bool isShiftedRight = index % 2 == 1;
-            final double leftPadding = isShiftedRight ? 190.0 : 68.0;
-            final double pillWidth = isShiftedRight ? 160.0 : 180.0;
-
-            final Color pillBgColor = subject.subjectColor;
-
-            return Positioned(
-              top: topOffset,
-              left: leftPadding,
-              child: GestureDetector(
-                onTap: () {
-                  setState(() => _selectedTask = item);
-                  if (MediaQuery.of(context).size.width < 700) {
-                    _showTaskDetailDrawer(item);
-                  }
-                },
-                onDoubleTap: () => _showEditTaskModal(item),
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  width: pillWidth,
-                  height: pillHeight,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 8,
-                  ),
-                  decoration: ShapeDecoration(
-                    color: pillBgColor,
-                    shape: const FigmaSmoothRectBorder(
-                      radius: 16,
-                      smoothing: 0.60,
+            if (isToday && liveOffset >= 0) ...[
+              Positioned(
+                top: liveOffset,
+                left: 48,
+                right: 16,
+                child: Row(
+                  children: [
+                    Container(
+                      width: 14,
+                      height: 14,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFFEF4444),
+                        shape: BoxShape.circle,
+                      ),
                     ),
-                    shadows: [
-                      BoxShadow(
-                        color: pillBgColor.withValues(alpha: 0.25),
-                        blurRadius: 6,
-                        offset: const Offset(0, 3),
+                    Expanded(
+                      child: Container(
+                        height: 2,
+                        color: const Color(0xFFEF4444),
                       ),
-                    ],
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(
-                        task.title,
-                        maxLines: pillHeight > 60 ? 2 : 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: GoogleFonts.quicksand(
-                          fontSize: 13,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        _formatDuration(task.durationMinutes),
-                        style: GoogleFonts.quicksand(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white.withValues(alpha: 0.9),
-                        ),
-                      ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ),
-            );
-          }),
-        ],
+            ],
+            ...scheduledPositions.map((position) {
+              final task = position.task;
+              final subject = position.subject;
+              final wrapper = _CalendarTaskWrapper(
+                subject: subject,
+                task: task,
+              );
+
+              final double leftPosition = 68.0 + position.leftIndent;
+              const double pillWidth = 220.0;
+              final bool isSelected = _selectedTasks.contains(wrapper);
+
+              return Positioned(
+                top: position.topOffset,
+                left: leftPosition,
+                child: TaskPillCard(
+                  title: task.title,
+                  durationMinutes: task.durationMinutes,
+                  subjectColor: subject.subjectColor,
+                  width: pillWidth,
+                  height: position.height,
+                  isSelected: isSelected,
+                  isMultiSelectMode: _isMultiSelectMode,
+                  onTap: () {
+                    if (_isMultiSelectMode) {
+                      _toggleTaskSelection(wrapper);
+                    } else {
+                      setState(() => _selectedTask = wrapper);
+                      if (MediaQuery.of(context).size.width < 700) {
+                        _showTaskDetailDrawer(wrapper);
+                      }
+                    }
+                  },
+                  onLongPress: () {
+                    if (!_isMultiSelectMode) {
+                      setState(() {
+                        _isMultiSelectMode = true;
+                        _selectedTasks.add(wrapper);
+                      });
+                    }
+                  },
+                  onDismissed: (_) => _completeTaskFromReview(wrapper),
+                ),
+              );
+            }),
+          ],
+        ),
       ),
     );
   }
@@ -875,4 +1032,15 @@ class _CalendarTaskWrapper {
   final TaskItem task;
 
   _CalendarTaskWrapper({required this.subject, required this.task});
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is _CalendarTaskWrapper &&
+          runtimeType == other.runtimeType &&
+          task.id == other.task.id &&
+          subject.name == other.subject.name;
+
+  @override
+  int get hashCode => task.id.hashCode ^ subject.name.hashCode;
 }
